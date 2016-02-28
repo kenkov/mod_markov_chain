@@ -54,7 +54,7 @@ class MarkovChain:
     def generate(
             self,
             query: Union[Tuple[str], Tuple[str, str]],
-            maxlen: int=40
+            maxlen: int=30
     ):
         head_query = query
         words = list(query)

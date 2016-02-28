@@ -29,7 +29,23 @@ class ModMarkovChain(Mod):
         replies = []
         for head, score in heads:
             query = (params.START_SYMBOL, head, )
-            replies.append(self.gen.generate(query))
+            query_cands = []
+
+            # search
+            min_len = float("inf")
+            min_sent = ""
+            for i in range(10):
+                sent = self.gen.generate(query)
+                if len(sent) < min_len:
+                    min_sent = sent
+                    min_len = len(min_sent)
+                query_cands.append(sent)
+            # log
+            for _cands in query_cands:
+                self.logger.info("".join(_cands[1:]))
+            if min_sent:
+                replies.append(min_sent)
+
         return ["".join(_[1:]) for _ in replies]
 
     def can_utter(self, message, master):
