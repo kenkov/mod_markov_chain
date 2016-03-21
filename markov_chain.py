@@ -3,17 +3,17 @@
 
 import random
 import sqlite3
-from typing import Tuple, Union
+from typing import Tuple, Union, List
 from collections import defaultdict
 import params
-
-
-class NotFoundException(Exception):
-    def __init__(self, value):
-        self.value = value
-
-    def __str__(self):
-        return repr(self.value)
+import pmi
+import langmodel
+from langmodel import NotFoundException
+import logging
+import traceback
+import heapq
+import math
+import datetime
 
 
 class MarkovChain:
@@ -22,122 +22,125 @@ class MarkovChain:
             dbname: str
     ):
         self.dbname = dbname
-        self.conn = sqlite3.connect(self.dbname)
-        self.cur = self.conn.cursor()
+        self.lm = langmodel.TriGram(dbname)
+        self.pmi = pmi.PMI(dbname)
 
-    def select_one(self, query: Union[Tuple[str], Tuple[str, str]]):
-        assert len(query) in {1, 2}
-        if len(query) == 1:
-            search_query = 'select * from chain where w1=?'
-        else:
-            search_query = 'select * from chain where w1=? and w2=?'
+    def select_one(
+            self,
+            words: List[str],
+            w1: str,
+            w2: str,
+            mode: str,
+            random_range: int=1
+    ) -> str:
+        assert mode in {"pmi", "lang", "both"}
 
-        self.cur.execute(search_query, query)
-        items = self.cur.fetchall()
-
-        if not items:
+        cands = self.lm.cands(w1, w2)
+        if not cands:
             raise NotFoundException(
-                "next words not found in {}".format(self.dbname)
+                "no candidates found in select_one:{} {} {}".format(
+                    words, w1, w2
+                )
             )
+        logging.info("w1={}, w2={}, num of candidates: {}, mode:{}".format(
+            w1, w2, len(cands), mode
+        ))
 
-        cands = defaultdict(int)
-        for coll in items:
-            # w2 or w3 の count を足す
-            #   cands[w2] += count if len(query) == 1
-            #   cands[w3] += count if len(query) == 3
-            cands[coll[-2]] += coll[-1]
+        pq = [(-float("inf"), ) for _ in range(5)]
+        lang_flag = mode in {"lang", "both"}
+        pmi_flag = mode in {"pmi", "both"}
+        lang_pq = [(-float("inf"), ) for _ in range(5)]
+        pmi_pq = [(-float("inf"), ) for _ in range(5)]
+        pmi_total = 0
 
-        return random.choice(
-            sum([[word] * cnt for word, cnt in cands.items()], [])
-        )
+        ts = datetime.datetime.now()
+        for i, w3 in enumerate(cands):
+            # debug log
+            if (i+1) % 100 == 0:
+                now = datetime.datetime.now()
+                delta = now - ts
+                ts = now
+                logging.debug("{} prosessed: {}".format(
+                    i+1, delta
+                ))
+
+            # lang
+            lm_prob = self.lm.prob(w1, w2, w3)
+            heapq.heappushpop(lang_pq, (lm_prob, w3))
+            # PMI
+            pmi = sum(self.pmi.pmi(word, w3) for word in words)
+            pmi_total += pmi
+            heapq.heappushpop(pmi_pq, (pmi, w3))
+            # lang * PMI
+            heapq.heappushpop(pq, (lm_prob * pmi, w3, lm_prob, pmi))
+
+        if pmi_total == 0:
+            logging.info(
+                "\tpmi_total = {}: pmi and both mode unavailable".format(
+                    pmi_total
+                ))
+        s_lang_pq = list(
+            sorted(
+                [item for item in lang_pq if item[0] != -float("inf")],
+                reverse=True
+            ))
+        for lm_prob, w3 in s_lang_pq:
+            logging.info("\tP({}|{}, {}) = {:.6}".format(
+                w3, w1, w2, lm_prob
+            ))
+        if pmi_total > 0:
+            s_pmi_pq = list(
+                sorted(
+                    [item for item in pmi_pq if item[0] != -float("inf")],
+                    reverse=True
+                ))
+            for pmi, w3 in s_pmi_pq:
+                logging.info("\tPMI({}) = {}: prob {:.6}".format(
+                    w3, pmi, pmi / pmi_total
+                ))
+            spq = list(
+                sorted(
+                    [item for item in pq if item[0] != -float("inf")],
+                    reverse=True
+                ))
+            for prob, w3, lm_prob, pmi in spq:
+                logging.info("\tP({}|{}, {}) = {:.6} = {:.6} * {:.6}".format(
+                    w3, w1, w2, prob,
+                    lm_prob, prob/pmi_total
+                ))
+        if mode == "lang" or pmi_total == 0:
+            ret_lst = s_lang_pq
+        elif mode == "pmi":
+            ret_lst = s_pmi_pq
+        elif mode == "both":
+            ret_lst = spq
+
+        return random.choice(ret_lst[:random_range])[1]
 
     def generate(
             self,
-            query: Union[Tuple[str], Tuple[str, str]],
-            maxlen: int=30
+            words: List[str],
+            maxlen: int=30,
+            mode: str="both",
+            random_range: int=1
     ):
-        head_query = query
-        words = list(query)
+        logging.info("generating sentence in mode: {}".format(mode))
+        rep = [params.START_SYMBOL0, params.START_SYMBOL1]
+        # rep = [params.START_SYMBOL1, "今日"]
+        first_word_flag = True
         while True:
             try:
-                next_word = self.select_one(head_query)
-                if next_word == params.END_SYMBOL or len(words) == maxlen:
+                next_word = self.select_one(
+                    words, rep[-2], rep[-1],
+                    mode="pmi" if first_word_flag else mode,
+                    random_range=random_range if first_word_flag else 1
+                )
+                if first_word_flag:
+                    first_word_flag = False
+                if next_word == params.END_SYMBOL or len(rep) == maxlen:
                     break
-                words.append(next_word)
-                head_query = words[-2:]
+                rep.append(next_word)
             except NotFoundException:
+                traceback.print_exc()
                 break
-        return words
-
-
-if __name__ == "__main__":
-
-    def insert(cur, query):
-        cur.execute(
-            'select * from chain where w1=? and w2=? and w3=?',
-            query
-        )
-        items = cur.fetchall()
-
-        if len(items) > 1:
-            assert("items duplicated")
-
-        if items:
-            count = items[0][3]
-            cur.execute(
-                "update chain set count=? where w1=? and w2=? and w3=?",
-                (count + 1, ) + query
-            )
-        else:
-            cur.execute(
-                "insert into chain values (?,?,?,?)",
-                query + (1,)
-            )
-
-    from argparse import ArgumentParser
-    import logging
-
-    # logging config
-    logging.basicConfig(
-        level=logging.INFO
-    )
-
-    p = ArgumentParser(
-        description='Markov Chain DB generator',
-    )
-    p.add_argument('db', help='database name')
-    p.add_argument('filename', help='corpus file name')
-    args = p.parse_args()
-
-    conn = sqlite3.connect(args.db)
-    cur = conn.cursor()
-    conn.execute((
-        "create table chain"
-        "(w1 text, w2 text, w3 text, count int)"
-    ))
-    conn.execute((
-        "create index index_chain_w1_w2_w3 on chain"
-        "(w1, w2, w3)"
-    ))
-    conn.execute((
-        "create index index_chain_w1_w2 on chain"
-        "(w1, w2)"
-    ))
-    conn.execute((
-        "create index index_chain_w1 on chain"
-        "(w1)"
-    ))
-
-    with open(args.filename) as fd:
-        for i, line in enumerate(_.strip() for _ in fd):
-            words = (
-                [params.START_SYMBOL] +
-                line.split() +
-                [params.END_SYMBOL]
-            )
-            for query in zip(words, words[1:], words[2:]):
-                insert(cur, query)
-            if (i + 1) % 10000 == 0:
-                logging.info("{} lines processed".format(i + 1))
-    conn.commit()
-    conn.close()
+        return rep[2:]

@@ -20,68 +20,57 @@ class PMI:
         self.num_total = self.cur.execute(
             'select sum(count) from pmi'
         ).fetchone()[0]
+        self.num_s_plus_t = (
+            self.cur.execute('select sum(count) from s_pmi').fetchone()[0] +
+            self.cur.execute('select sum(count) from t_pmi').fetchone()[0]
+        )
+        logging.info("PMI info: num_s_t={}, num_s+num_t={}".format(
+            self.num_total, self.num_s_plus_t)
+        )
 
     def pmi(self, s, t):
 
-        num_s = self.cur.execute(
-            'select sum(count) from pmi where s=?',
+        self.cur.execute(
+            'select count from s_pmi where s=?',
             (s, )
-        ).fetchone()[0]
-        num_t = self.cur.execute(
-            'select sum(count) from pmi where t=?',
+        )
+        _num_s = self.cur.fetchall()
+        self.cur.execute(
+            'select count from t_pmi where t=?',
             (t, )
-        ).fetchone()[0]
-        num_s_t = self.cur.execute(
-            'select sum(count) from pmi where s=? and t=?',
+        )
+        _num_t = self.cur.fetchall()
+        self.cur.execute(
+            'select count from pmi where s=? and t=?',
             (s, t)
-        ).fetchone()[0]
-        logging.debug("{} {} {}".format(num_s_t, num_s, num_t))
+        )
+        _num_s_t = self.cur.fetchall()
 
-        has_val = num_s and num_t and num_s_t
+        has_val = _num_s and _num_t and _num_s_t
         if has_val:
+            assert len(_num_s) == 1
+            assert len(_num_t) == 1
+            assert len(_num_s_t) == 1
+            num_s = _num_s[0][0]
+            num_t = _num_t[0][0]
+            num_s_t = _num_s_t[0][0]
+            # logging.debug("{} {} {}".format(num_s_t, num_s, num_t))
             # 低頻度バイアスに対応した PPMI 計算
             pmi_val = (
-                math.log(num_s_t)
-                - math.log(num_s)
-                - math.log(num_t)
-                + math.log(self.num_total)
+                math.log(num_s_t) - (math.log(num_s) + math.log(num_t)) +
+                math.log(self.num_s_plus_t / 2)  # - math.log(self.num_total)
             ) * (
                 (num_s_t / (num_s_t + 1)) *
                 min(num_s, num_t) / (min(num_s, num_t) + 1)
             )
         else:
             pmi_val = 0
-            logging.debug(
-                "PMI key error: num_{}={} num_{}={} num_{}_{}={}".format(
-                    s, num_s, t, num_t, s, t, num_s_t
-                ))
+            # logging.debug("PMI key error: {} {}".format(s, t))
         return pmi_val if pmi_val >= 0 else 0
 
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
-
-    def insert(cur, query):
-        cur.execute(
-            'select * from pmi where s=? and t=?',
-            query
-        )
-        items = cur.fetchall()
-
-        if len(items) > 1:
-            assert("items duplicated")
-
-        if items:
-            count = items[0][2]
-            cur.execute(
-                "update pmi set count=? where s=? and t=?",
-                (count + 1, ) + query
-            )
-        else:
-            cur.execute(
-                "insert into pmi values (?,?,?)",
-                query + (1,)
-            )
 
     # logging config
     logging.basicConfig(
@@ -95,44 +84,57 @@ if __name__ == '__main__':
     p.add_argument('filename', help='corpus file name')
     args = p.parse_args()
 
-    # setup db
-    conn = sqlite3.connect(args.db)
-    cur = conn.cursor()
-    conn.execute((
-        "create table pmi"
-        "(s text, t text, count int)"
-    ))
-    conn.execute((
-        "create index index_s_t on pmi"
-        "(s, t)"
-    ))
-    conn.execute((
-        "create index index_s on pmi"
-        "(s)"
-    ))
-    conn.execute((
-        "create index index_t on pmi"
-        "(t)"
-    ))
+    from collections import defaultdict
+    s_dic = defaultdict(int)
+    t_dic = defaultdict(int)
+    s_t_dic = defaultdict(int)
 
     with open(args.filename) as fd:
         for i, line in enumerate(_.strip() for _ in fd):
             orig, reply = line.split("\t")
             orig_words = (
-                [params.START_SYMBOL] +
+                [params.START_SYMBOL0, params.START_SYMBOL1] +
                 orig.split() +
                 [params.END_SYMBOL]
             )
             reply_words = (
-                [params.START_SYMBOL] +
+                [params.START_SYMBOL0, params.START_SYMBOL1] +
                 reply.split() +
                 [params.END_SYMBOL]
             )
-
+            # for orig_word in orig_words:
+            #     s_dic[orig_word] += 1
+            # for reply_word in reply_words:
+            #     t_dic[reply_word] += 1
             for orig_word in orig_words:
                 for reply_word in reply_words:
-                    insert(cur, (orig_word, reply_word))
+                    s_t_dic[(orig_word, reply_word)] += 1
+                    s_dic[orig_word] += 1
+                    t_dic[reply_word] += 1
             if (i + 1) % 10000 == 0:
                 logging.info("{} lines processed".format(i + 1))
-    conn.commit()
-    conn.close()
+    # conn.commit()
+    # conn.close()
+
+    for line in (
+        "create table pmi (s text, t text, count int);",
+        "create index pmi_s_t on pmi (s, t);",
+        "create table s_pmi (s text, count int);",
+        "create index s_pmi_s on s_pmi (s);",
+        "create table t_pmi (t text, count int);",
+        "create index t_pmi_t on t_pmi (t);",
+    ):
+        print(line)
+
+    for (s, t), count in s_t_dic.items():
+        print(
+            'insert into pmi values ("{}","{}",{});'.format(s, t, count)
+        )
+    for s, count in s_dic.items():
+        print(
+            'insert into s_pmi values ("{}",{});'.format(s, count)
+        )
+    for t, count in t_dic.items():
+        print(
+            'insert into t_pmi values ("{}",{});'.format(t, count)
+        )
