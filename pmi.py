@@ -20,13 +20,16 @@ class PMI:
         self.num_total = self.cur.execute(
             'select sum(count) from pmi'
         ).fetchone()[0]
-        self.num_s_plus_t = (
-            self.cur.execute('select sum(count) from s_pmi').fetchone()[0] +
-            self.cur.execute('select sum(count) from t_pmi').fetchone()[0]
-        )
-        logging.info("PMI info: num_s_t={}, num_s+num_t={}".format(
-            self.num_total, self.num_s_plus_t)
-        )
+        self.num_s = self.cur.execute(
+            'select sum(count) from s_pmi'
+        ).fetchone()[0]
+        self.num_t = self.cur.execute(
+            'select sum(count) from t_pmi'
+        ).fetchone()[0]
+        self.num_s_plus_t = self.num_s + self.num_t
+        logging.info("PMI info: num_s_t={}, num_s={}, num_t={}".format(
+            self.num_total, self.num_s, self.num_t
+        ))
 
     def pmi(self, s, t):
 
@@ -58,7 +61,8 @@ class PMI:
             # 低頻度バイアスに対応した PPMI 計算
             pmi_val = (
                 math.log(num_s_t) - (math.log(num_s) + math.log(num_t)) +
-                math.log(self.num_s_plus_t / 2)  # - math.log(self.num_total)
+                (math.log(self.num_s) + math.log(self.num_t) -
+                 math.log(self.num_total))
             ) * (
                 (num_s_t / (num_s_t + 1)) *
                 min(num_s, num_t) / (min(num_s, num_t) + 1)
